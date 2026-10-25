@@ -24,10 +24,35 @@ def _cosine(a, b):
     return float(np.dot(a, b) / denom)
 
 
+def _ats_api_key() -> str:
+    'Use the dedicated ATS key; never consume the interview question/evaluation pools.'
+    for name in ("GROQ_ATS_API_KEY", "GROQ_ATS_API_KEYS", "GROQ_RESUME_API_KEY"):
+        raw = os.getenv(name, "").strip()
+        if raw:
+            # The ATS role is designed for one dedicated key. If a comma-separated
+            # value is provided, try the first key; this avoids mixing pools.
+            return re.split(r"[,;\n]", raw)[0].strip().strip("\"'")
+    return ""
+
+
+def _ats_model_pool() -> list:
+    raw = os.getenv("INTERVIEW_LLM_MODELS", "")
+    candidates = [item.strip() for item in re.split(r"[,;\n]", raw) if item.strip()]
+    candidates.extend([
+        os.getenv("INTERVIEW_LLM_MODEL", "openai/gpt-oss-120b").strip(),
+        os.getenv("INTERVIEW_LLM_FALLBACK_MODEL", "openai/gpt-oss-20b").strip(),
+    ])
+    result = []
+    for model in candidates:
+        if model and model not in result:
+            result.append(model)
+    return result
+
+
 def _llm_screening_review(resume: str, role: str, skills: str, jd: str, semantic: float, checks: Dict) -> Dict:
-    key = os.getenv("GROQ_API_KEY", "").strip()
+    key = _ats_api_key()
     if not key:
-        raise RuntimeError("GROQ_API_KEY is not configured")
+        raise RuntimeError("GROQ_ATS_API_KEY is not configured")
     from groq import Groq
     prompt = f'''You are an expert resume screening reviewer. Estimate how well this resume may pass common industry ATS / AI-assisted recruiter screening for the target role. You do not have access to any employer's proprietary ATS or actual applicant pool, so do NOT claim to predict a guaranteed shortlist.
 
@@ -56,15 +81,45 @@ Return ONLY valid JSON with this schema:
  "jdMissingKeywords": ["..."]
 }}
 Scores should be strict and job-specific. If no JD is supplied, score against typical industry expectations for the target role and explicitly lower confidence. Use concise, practical advice.'''
-    response = Groq(api_key=key).chat.completions.create(
-        model=LLM_MODEL,
-        messages=[{"role": "system", "content": prompt}],
-        temperature=0.15,
-        max_tokens=2300,
-        response_format={"type": "json_object"},
-    )
-    raw = response.choices[0].message.content or "{}"
-    return json.loads(raw)
+    failures = []
+    for model in _ats_model_pool():
+        client = Groq(api_key=key)
+        for json_mode in (True, False):
+            try:
+                kwargs = {
+                    "model": model,
+                    "messages": [{"role": "system", "content": prompt}],
+                    "temperature": 0.15,
+                    "max_tokens": 1800,
+                }
+                if json_mode:
+                    kwargs["response_format"] = {"type": "json_object"}
+                response = client.chat.completions.create(**kwargs)
+                raw = (response.choices[0].message.content or "").strip()
+                if not raw:
+                    failures.append(f"{model}: empty content")
+                    continue
+                # Some providers wrap JSON in Markdown despite instructions.
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE).strip()
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    left, right = raw.find("{"), raw.rfind("}")
+                    if left >= 0 and right > left:
+                        parsed = json.loads(raw[left:right + 1])
+                    else:
+                        raise
+                if not isinstance(parsed, dict):
+                    raise ValueError("ATS model response was not a JSON object")
+                return parsed
+            except Exception as exc:
+                failures.append(f"{model} ({'json' if json_mode else 'plain'}): {type(exc).__name__}: {str(exc)[:180]}")
+                # If the failure looks like a hard quota/rate limit, the next model
+                # is the best chance; do not retry the same model in plain mode.
+                low = str(exc).lower()
+                if any(token in low for token in ("rate limit", "rate_limit", "tokens per day", "model_not_found", "not found")):
+                    break
+    raise RuntimeError("ATS Groq model pool failed: " + " | ".join(failures[-6:]))
 
 
 def analyze_resume_text(text: str, target_role: str = "", skills: str = "", job_description: str = "") -> Dict:
@@ -143,5 +198,5 @@ def analyze_resume_text(text: str, target_role: str = "", skills: str = "", job_
             "gaps": [], "keywordsToInclude": [], "summaryParagraph": "", "bulletRewrites": [],
             "priorityActions": improvements,
             "jdMatchedKeywords": [], "jdMissingKeywords": [],
-            "note": "Fallback estimate, not a universal ATS score. Configure GROQ_API_KEY and provide a job description for the most targeted review.",
+            "note": "Fallback estimate, not a universal ATS score. Configure the dedicated GROQ_ATS_API_KEY and provide a job description for the most targeted review.",
         }

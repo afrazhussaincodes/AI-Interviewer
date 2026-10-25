@@ -25,6 +25,11 @@ def env_float(name, default, minimum, maximum):
 
 YOLO_MODEL = "yolo11n.pt"
 
+# Load one YOLO model per Python process instead of duplicating the model for
+# every browser session. The proctor server serializes inference access.
+_SHARED_YOLO_MODEL = None
+_SHARED_YOLO_LOCK = threading.Lock()
+
 MAX_WARNINGS = 50
 
 LOOK_AWAY_SECONDS = env_float("PROCTOR_LOOK_AWAY_SECONDS", 2.0, 0.1, 60.0)
@@ -126,7 +131,11 @@ class InterviewObjectDetector:
 
         print("Loading YOLO...")
 
-        self.model = YOLO(YOLO_MODEL)
+        global _SHARED_YOLO_MODEL
+        with _SHARED_YOLO_LOCK:
+            if _SHARED_YOLO_MODEL is None:
+                _SHARED_YOLO_MODEL = YOLO(YOLO_MODEL)
+            self.model = _SHARED_YOLO_MODEL
 
         print("YOLO loaded.")
 

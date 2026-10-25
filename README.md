@@ -18,3 +18,13 @@ The frontend talks to `http://localhost:4000/api`. The interview room talks to t
 - Resume upload parses PDF/DOCX/TXT, stores the text and file metadata in MongoDB, and autofills editable profile fields.
 - Interview Setup reads the stored profile/resume every time it opens.
 - Resume Analysis calls the backend and displays the live ATS score.
+
+## Groq API key pools (5 keys)
+
+Configure these in `backend/.env` using `backend/.env.example` as a template:
+- `GROQ_EVALUATION_API_KEYS`: two keys for normal, coding, and SQL answer evaluation.
+- `GROQ_QUESTION_API_KEYS`: two keys for all interview question generation, including coding and SQL.
+- `GROQ_ATS_API_KEY`: the fifth key, reserved exclusively for ATS resume scoring through `/analyze-resume`.
+- `GROQ_API_KEY`: still used by the existing transcription endpoint; set it to your primary question key unless you have a separate transcription key.
+
+The interview's one-time compact resume summary uses the question-key pool; it does not consume the ATS-scoring key. ATS scoring tries the configured model pool with the dedicated ATS key and falls back to transparent semantic/structure scoring if AI scoring is unavailable. Do not commit real API keys.

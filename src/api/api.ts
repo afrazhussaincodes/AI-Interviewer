@@ -266,6 +266,24 @@ export const api = {
       }
     ),
 
+  getInterviewPreparationStatus: (
+    interviewId: string
+  ) =>
+    request(
+      `/live-interviews/${interviewId}/preparation-status`
+    ),
+
+  getNextInterviewQuestion: (
+    interviewId: string
+  ) =>
+    request(
+      `/live-interviews/${interviewId}/next-question`,
+      {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }
+    ),
+
   // ----------------------------------------------------------
   // TRANSCRIPTION
   // ----------------------------------------------------------

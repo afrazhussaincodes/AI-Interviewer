@@ -23,5 +23,6 @@ exports.transcribe = async (buffer, filename, mimeType) => {
 
 exports.generateQuestionBank = (payload) => agent('/generate-bank', payload);
 exports.generateNextQuestion = (payload) => agent('/next-question', payload, 45000);
+exports.prepareFollowupQuestions = (payload) => agent('/prepare-followup-questions', payload, 120000);
 exports.preloadInterviewContext = (payload) => agent('/preload-context', payload, 120000);
 exports.analyzeResume = (payload) => agent('/analyze-resume', payload, 45000);

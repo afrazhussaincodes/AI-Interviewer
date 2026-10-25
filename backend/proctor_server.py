@@ -1,3 +1,11 @@
+import os
+
+# Keep CPU math libraries from spawning many worker threads on a memory-limited machine.
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 from flask import Flask, request
 from flask_socketio import SocketIO, emit
 
@@ -8,9 +16,22 @@ import time
 import sys
 import threading
 import gc
-import os
-
+from contextlib import nullcontext
 from pathlib import Path
+
+try:
+    import torch
+    torch.set_num_threads(2)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        # PyTorch may already have initialized its inter-op pool.
+        pass
+except Exception as torch_import_error:
+    torch = None
+    print(f"PyTorch thread limit not applied: {torch_import_error}", flush=True)
+
+cv2.setNumThreads(1)
 
 
 # ============================================================
@@ -63,6 +84,18 @@ detectors = {}
 detector_locks = {}
 
 detectors_lock = threading.Lock()
+
+# Only one inference/decode pipeline runs at a time. Other arriving frames are
+# dropped immediately instead of waiting in threads while holding large images.
+global_frame_lock = threading.Lock()
+last_frame_at = {}
+last_frame_lock = threading.Lock()
+MIN_FRAME_INTERVAL_SECONDS = max(
+    0.12,
+    min(1.0, float(os.environ.get("PROCTOR_MIN_FRAME_INTERVAL_SECONDS", "0.20")))
+)
+MAX_BASE64_FRAME_CHARS = 3_000_000
+MAX_FRAME_WIDTH = 640
 
 
 # ============================================================
@@ -395,6 +428,9 @@ def disconnected():
             None
         )
 
+    with last_frame_lock:
+        last_frame_at.pop(sid, None)
+
     if detector:
 
         try:
@@ -443,145 +479,97 @@ def reset_proctoring():
 
 @socketio.on("video_frame")
 def video_frame(payload):
-
     sid = request.sid
+    detector = None
+    session_lock = None
+    session_lock_acquired = False
+    global_lock_acquired = False
+    raw = None
+    frame = None
+    encoded_array = None
+    response = None
+
+    # Throttle early, before decoding base64 or allocating image arrays.
+    now = time.monotonic()
+    with last_frame_lock:
+        previous = last_frame_at.get(sid, 0.0)
+        if now - previous < MIN_FRAME_INTERVAL_SECONDS:
+            return
+        last_frame_at[sid] = now
+
+    # A busy server drops this frame instead of queueing it and retaining RAM.
+    if not global_frame_lock.acquire(blocking=False):
+        return
+    global_lock_acquired = True
 
     try:
+        detector, session_lock = get_detector(sid)
+        if not session_lock.acquire(blocking=False):
+            return
+        session_lock_acquired = True
 
-        # ----------------------------------------------------
-        # GET DETECTOR
-        # ----------------------------------------------------
-
-        detector, lock = get_detector(
-            sid
-        )
-
-        # ----------------------------------------------------
-        # GET IMAGE
-        # ----------------------------------------------------
-
-        if isinstance(
-            payload,
-            dict
-        ):
-
-            data = payload.get(
-                "image",
-                ""
-            )
-
+        if isinstance(payload, dict):
+            data = payload.get("image", "")
         else:
-
-            data = str(payload)
+            data = str(payload or "")
 
         if not data:
-
-            emit(
-                "proctor_error",
-                {
-                    "error":
-                        "No image received"
-                }
-            )
-
+            emit("proctor_error", {"error": "No image received"})
             return
-
-        # ----------------------------------------------------
-        # REMOVE DATA URL
-        # ----------------------------------------------------
 
         if "," in data:
+            data = data.split(",", 1)[1]
 
-            data = data.split(
-                ",",
-                1
-            )[1]
-
-        # ----------------------------------------------------
-        # DECODE
-        # ----------------------------------------------------
-
-        raw = base64.b64decode(
-            data
-        )
-
-        frame = cv2.imdecode(
-            np.frombuffer(
-                raw,
-                dtype=np.uint8
-            ),
-            cv2.IMREAD_COLOR
-        )
-
-        if frame is None:
-
-            emit(
-                "proctor_error",
-                {
-                    "error":
-                        "Could not decode webcam frame"
-                }
-            )
-
+        if len(data) > MAX_BASE64_FRAME_CHARS:
+            emit("proctor_error", {"error": "Frame is too large; send a smaller webcam image."})
             return
 
-        # ----------------------------------------------------
-        # SERVER-SIDE MONOTONIC TIMESTAMP
-        # ----------------------------------------------------
+        raw = base64.b64decode(data, validate=False)
+        encoded_array = np.frombuffer(raw, dtype=np.uint8)
+        frame = cv2.imdecode(encoded_array, cv2.IMREAD_COLOR)
 
-        timestamp_ms = int(
-            time.monotonic() * 1000
-        )
+        if frame is None:
+            emit("proctor_error", {"error": "Could not decode webcam frame"})
+            return
 
-        # ----------------------------------------------------
-        # CRITICAL LOCK
-        #
-        # Only ONE frame from this browser
-        # enters the detector at a time.
-        # ----------------------------------------------------
-
-        with lock:
-
-            result = (
-                detector.process_frame(
-                    frame,
-                    timestamp_ms
-                )
+        # Resize before any detector work so YOLO and MediaPipe receive a small frame.
+        height, width = frame.shape[:2]
+        if width > MAX_FRAME_WIDTH:
+            new_height = max(1, int(height * MAX_FRAME_WIDTH / width))
+            frame = cv2.resize(
+                frame,
+                (MAX_FRAME_WIDTH, new_height),
+                interpolation=cv2.INTER_AREA,
             )
 
-        # ----------------------------------------------------
-        # SERIALIZE
-        # ----------------------------------------------------
+        timestamp_ms = int(time.monotonic() * 1000)
+        inference_context = torch.inference_mode() if torch is not None else nullcontext()
+        with inference_context:
+            result = detector.process_frame(frame, timestamp_ms)
 
-        response = serialise_result(
-            detector,
-            result
-        )
-
-        # ----------------------------------------------------
-        # SEND TO FRONTEND
-        # ----------------------------------------------------
-
-        emit(
-            "proctor_result",
-            response
-        )
+        response = serialise_result(detector, result)
+        emit("proctor_result", response)
 
     except Exception as e:
-
-        print()
-        print(
-            "Frame processing error:",
-            repr(e)
-        )
-
-        emit(
-            "proctor_error",
-            {
-                "error":
-                    str(e)
-            }
-        )
+        print("Frame processing error:", repr(e), flush=True)
+        # Do not kill the server or send internal stack traces to the browser.
+        emit("proctor_error", {"error": "Frame processing failed. Please keep the webcam resolution low and try again."})
+    finally:
+        if session_lock_acquired and session_lock is not None:
+            try:
+                session_lock.release()
+            except RuntimeError:
+                pass
+        if global_lock_acquired:
+            try:
+                global_frame_lock.release()
+            except RuntimeError:
+                pass
+        # Drop references promptly; do not force a costly full GC on every frame.
+        raw = None
+        frame = None
+        encoded_array = None
+        response = None
 
 
 # ============================================================

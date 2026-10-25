@@ -27,6 +27,9 @@ interface Question {
   constraints?: any[]
   examples?: any[]
   language?: string
+  questionType?: string
+  crossQuestion?: boolean
+  isFollowUp?: boolean
   raw?: any
 }
 
@@ -75,6 +78,9 @@ const normaliseQuestion = (raw: any, id: number): Question => {
     constraints: Array.isArray(raw?.constraints) ? raw.constraints : [],
     examples: Array.isArray(raw?.examples) ? raw.examples : [],
     language: raw?.language || '',
+    questionType: String(raw?.questionType || raw?.question_type || ''),
+    crossQuestion: Boolean(raw?.crossQuestion || raw?.cross_question || raw?.isFollowUp || raw?.is_follow_up),
+    isFollowUp: Boolean(raw?.isFollowUp || raw?.is_follow_up || raw?.crossQuestion || raw?.cross_question),
     raw,
   }
 }
@@ -422,6 +428,10 @@ export default function InterviewRoom({ onNavigate, setup: setupProp }: Props) {
   const [evaluation, setEvaluation] = useState<any>(null)
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState('Preparing interview…')
+  const [adaptivePrepActive, setAdaptivePrepActive] = useState(false)
+  const [adaptivePrepCountdown, setAdaptivePrepCountdown] = useState(0)
+  const [adaptivePrepMessage, setAdaptivePrepMessage] = useState('')
+  const [adaptivePrepError, setAdaptivePrepError] = useState('')
   const [showEndModal, setShowEndModal] = useState(false)
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768)
 
@@ -1207,6 +1217,105 @@ export default function InterviewRoom({ onNavigate, setup: setupProp }: Props) {
     }
   }
 
+  async function waitForAdaptiveQuestion(breakSeconds = 0): Promise<any> {
+    if (!interviewId) throw new Error('Interview session is unavailable.')
+
+    const breakEnd = Date.now() + Math.max(0, breakSeconds) * 1000
+    setAdaptivePrepActive(true)
+    setAdaptivePrepError('')
+    setAdaptivePrepMessage(
+      breakSeconds > 0
+        ? 'Take a short break while ARIA prepares your next questions.'
+        : 'ARIA is preparing your next adaptive question…'
+    )
+
+    const delay = (ms: number) =>
+      new Promise<void>(resolve => window.setTimeout(resolve, ms))
+
+    let failedRetries = 0
+    while (true) {
+      const remaining = Math.max(0, Math.ceil((breakEnd - Date.now()) / 1000))
+      setAdaptivePrepCountdown(remaining)
+
+      let prepStatus: any
+      try {
+        prepStatus = await api.getInterviewPreparationStatus(interviewId)
+      } catch {
+        setAdaptivePrepMessage('Connecting to the question preparation service…')
+        await delay(1200)
+        continue
+      }
+
+      if (prepStatus?.status === 'failed') {
+        if (failedRetries < 2) {
+          failedRetries += 1
+          setAdaptivePrepError('')
+          setAdaptivePrepMessage(`Retrying question preparation (${failedRetries}/2)…`)
+          try {
+            const retry = await api.getNextInterviewQuestion(interviewId)
+            if (retry?.nextQuestion && remaining <= 0) {
+              setAdaptivePrepActive(false)
+              return retry
+            }
+          } catch {
+            // The next poll will show the most recent backend preparation state.
+          }
+          await delay(1200)
+          continue
+        }
+        const message = String(prepStatus?.error || 'Question preparation failed. Check the backend logs and API key configuration.')
+        setAdaptivePrepError(message)
+        setAdaptivePrepMessage('ARIA could not prepare the next questions.')
+        throw new Error(message)
+      }
+
+      if (remaining <= 0 && prepStatus?.ready) {
+        const nextResult = await api.getNextInterviewQuestion(interviewId)
+        if (nextResult?.nextQuestion) {
+          setAdaptivePrepActive(false)
+          setAdaptivePrepCountdown(0)
+          setAdaptivePrepError('')
+          return nextResult
+        }
+        if (nextResult?.preparationRequired) {
+          setAdaptivePrepMessage('Finalizing your next question…')
+        }
+      } else if (remaining <= 0) {
+        setAdaptivePrepMessage('Waiting for ARIA to finish preparing your questions…')
+      }
+
+      await delay(1000)
+    }
+  }
+
+  async function retryAdaptivePreparation() {
+    try {
+      setAdaptivePrepError('')
+      const result = await waitForAdaptiveQuestion(0)
+      const raw = result?.nextQuestion
+      if (!raw) throw new Error('No next question was returned.')
+      const hardQuestionLimit = Number(plan?.total || setup?.questionCount || setup?.plannedQuestions || 0)
+      if (hardQuestionLimit > 0 && questions.length >= hardQuestionLimit) {
+        await finishInterview('planned_question_count')
+        return
+      }
+      const next = normaliseQuestion(raw, questions.length + 1)
+      setQuestions(prev => [...prev, next])
+      setQIndex(prev => prev + 1)
+      setWorkspaceOpen(null)
+      setEvaluation(null)
+      setLiveTranscript('')
+      setEditedTranscript('')
+      userEditedRef.current = false
+      setTranscript(prev => [...prev, { speaker: 'ARIA', text: next.text }])
+      setStatus('ARIA is preparing the next question…')
+      window.setTimeout(() => speakQuestion(next.text, next.type), 300)
+    } catch (error: any) {
+      setAdaptivePrepActive(true)
+      setAdaptivePrepError(error?.message || 'Question preparation failed. Please try again.')
+    }
+  }
+
   async function submitAnswer(answer: string, section: QType, codingSubmission: any = null) {
     if (!interviewId || !currentQ || busy) return
     setBusy(true)
@@ -1225,6 +1334,9 @@ export default function InterviewRoom({ onNavigate, setup: setupProp }: Props) {
         transcript: answer,
         answer,
         section,
+        questionType: currentQ.questionType,
+        crossQuestion: currentQ.crossQuestion,
+        isFollowUp: currentQ.isFollowUp,
         questionPayload: currentQ,
         codingSubmission,
       })
@@ -1232,24 +1344,65 @@ export default function InterviewRoom({ onNavigate, setup: setupProp }: Props) {
       const result = await submitPromise
 
       setEvaluation(result.evaluation || null)
-      // Append 'You' text ONLY if not already added by handleVerbalAnswer
+
+      // Record the answer once, then either show the prepared question or
+      // enter the adaptive-preparation screen while the backend builds a queue.
       setTranscript(prev => {
-        const lastEntry = prev[prev.length - 1];
-        const alreadyHasUserAnswer = lastEntry && lastEntry.speaker === 'You' && lastEntry.text === answer;
-        const newEntries = [];
+        const lastEntry = prev[prev.length - 1]
+        const alreadyHasUserAnswer =
+          lastEntry && lastEntry.speaker === 'You' && lastEntry.text === answer
+        const newEntries: { speaker: string; text: string }[] = []
         if (!alreadyHasUserAnswer) {
-          newEntries.push({ speaker: 'You', text: answer || (section === 'coding' ? '[Coding submission]' : '[SQL submission]') });
+          newEntries.push({
+            speaker: 'You',
+            text: answer || (section === 'coding' ? '[Coding submission]' : section === 'sql' ? '[SQL submission]' : '[No answer]'),
+          })
         }
-        newEntries.push({ speaker: 'ARIA', text: result.nextQuestion ? (result.nextQuestion.text || result.nextQuestion.question || result.nextQuestion) : 'Thank you. That completes the interview.' });
-        return [...prev, ...newEntries];
+        if (result.preparationRequired) {
+          newEntries.push({
+            speaker: 'ARIA',
+            text: Number(result.breakSeconds || 0) > 0
+              ? 'Let’s take a one-minute break while I prepare the next set of questions.'
+              : 'I’m preparing the next question based on your answers so far.',
+          })
+        } else {
+          const rawNext = result.nextQuestion
+          const nextText = typeof rawNext === 'string'
+            ? rawNext
+            : rawNext?.text || rawNext?.question || rawNext?.prompt || 'Thank you. That completes the interview.'
+          newEntries.push({ speaker: 'ARIA', text: nextText })
+        }
+        return [...prev, ...newEntries]
       })
 
       if (result.done) {
-        await finishInterview()
+        await finishInterview(result?.summary?.completedBecause || 'interview_completed')
         return
       }
 
-      const next = normaliseQuestion(result.nextQuestion, questions.length + 1)
+      // Frontend-side safety net: never append a question beyond the selected plan,
+      // even if a stale backend response incorrectly includes another question.
+      const hardQuestionLimit = Number(plan?.total || setup?.questionCount || setup?.plannedQuestions || 0)
+      if (hardQuestionLimit > 0 && questions.length >= hardQuestionLimit) {
+        await finishInterview('planned_question_count')
+        return
+      }
+
+      let nextResponse = result
+      if (result.preparationRequired) {
+        nextResponse = await waitForAdaptiveQuestion(Number(result.breakSeconds || 0))
+        const preparedText = nextResponse?.nextQuestion?.text ||
+          nextResponse?.nextQuestion?.question ||
+          nextResponse?.nextQuestion?.prompt ||
+          'Please tell me more about your experience.'
+        setTranscript(prev => [...prev, { speaker: 'ARIA', text: String(preparedText) }])
+      }
+
+      if (!nextResponse?.nextQuestion) {
+        throw new Error('The interview service did not return the next question.')
+      }
+
+      const next = normaliseQuestion(nextResponse.nextQuestion, questions.length + 1)
       setQuestions(prev => [...prev, next])
       setQIndex(prev => prev + 1)
       setWorkspaceOpen(null)
@@ -1431,8 +1584,11 @@ export default function InterviewRoom({ onNavigate, setup: setupProp }: Props) {
     }
   }
 
+  // The selected question count includes cross-questions; progress must use
+  // every completed question, matching the backend's hard cap.
+  const completedQuestionCount = completedQs.size
   const progress = plan?.total
-    ? Math.min(100, Math.round((completedQs.size / Number(plan.total)) * 100))
+    ? Math.min(100, Math.round((completedQuestionCount / Number(plan.total)) * 100))
     : 0
 
   return (
@@ -2883,6 +3039,93 @@ export default function InterviewRoom({ onNavigate, setup: setupProp }: Props) {
               <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 10 }}><span style={{ fontSize: 26 }}>⚠️</span><div><h3 style={{ margin: 0, color: '#B45309', fontSize: 17 }}>Proctoring Warning</h3><div style={{ color: '#6B7280', fontSize: 11, marginTop: 3 }}>Warning {proctorWarningPopup.count}</div></div></div>
               <p style={{ fontSize: 14, lineHeight: 1.6, color: '#374151', margin: '0 0 16px' }}>{proctorWarningPopup.reason}</p>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid rgba(0,0,0,.08)', paddingTop: 12 }}><span style={{ fontSize: 11, color: '#92400E' }}>Please correct this and continue your interview.</span><button onClick={() => setProctorWarningPopup(null)} style={{ padding: '9px 22px', borderRadius: 8, border: 0, background: '#F59E0B', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>OK</button></div>
+            </div>
+          </div>
+        )}
+
+        {/* ADAPTIVE QUESTION PREPARATION / ONE-MINUTE BREAK */}
+        {adaptivePrepActive && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Preparing next interview questions"
+            style={{
+              position: 'fixed',
+              inset: 0,
+              zIndex: 120,
+              background: 'rgba(13, 13, 26, 0.82)',
+              backdropFilter: 'blur(10px)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 20,
+            }}
+          >
+            <div
+              style={{
+                width: '100%',
+                maxWidth: 480,
+                background: '#FAF9F5',
+                borderRadius: 22,
+                padding: isMobile ? '28px 22px' : '38px 34px',
+                textAlign: 'center',
+                boxShadow: '0 24px 80px rgba(0,0,0,0.25)',
+                border: '1px solid rgba(124,58,237,0.16)',
+              }}
+            >
+              <div
+                style={{
+                  width: 66,
+                  height: 66,
+                  borderRadius: '50%',
+                  margin: '0 auto 18px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: '#fff',
+                  fontSize: 28,
+                  background: 'linear-gradient(135deg, #7c3aed, #4f46e5)',
+                  animation: 'pulse 1.8s ease-in-out infinite',
+                }}
+              >
+                ✦
+              </div>
+              <h2 style={{ margin: '0 0 10px', color: '#1a1a2e', fontSize: isMobile ? 21 : 25 }}>
+                {adaptivePrepCountdown > 0 ? 'Take a short break' : 'ARIA is preparing'}
+              </h2>
+              <p style={{ margin: '0 auto 20px', maxWidth: 360, color: '#686887', fontSize: 14, lineHeight: 1.65 }}>
+                {adaptivePrepError || adaptivePrepMessage}
+              </p>
+              {adaptivePrepCountdown > 0 && (
+                <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: 42, fontWeight: 700, color: '#7c3aed', marginBottom: 14 }}>
+                  {fmt(adaptivePrepCountdown)}
+                </div>
+              )}
+              {!adaptivePrepError && (
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, color: '#8a8aa8', fontSize: 12 }}>
+                  <span className="wave-bar" style={{ width: 5, height: 16, borderRadius: 3, background: '#7c3aed' }} />
+                  <span className="wave-bar" style={{ width: 5, height: 22, borderRadius: 3, background: '#7c3aed', animationDelay: '0.12s' }} />
+                  <span className="wave-bar" style={{ width: 5, height: 12, borderRadius: 3, background: '#7c3aed', animationDelay: '0.24s' }} />
+                  <span>Using your previous answers to personalize the next questions</span>
+                </div>
+              )}
+              {adaptivePrepError && (
+                <button
+                  onClick={() => void retryAdaptivePreparation()}
+                  style={{
+                    marginTop: 20,
+                    padding: '11px 22px',
+                    border: 0,
+                    borderRadius: 9,
+                    background: 'linear-gradient(135deg, #7c3aed, #4f46e5)',
+                    color: '#fff',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Retry preparation
+                </button>
+              )}
             </div>
           </div>
         )}

@@ -242,6 +242,9 @@ export default function InterviewSetup({ onNavigate }: { onNavigate: (s: Screen)
         company_name: company,
         duration,
         duration_min: duration,
+        questionCount: plannedQuestions,
+        question_count: plannedQuestions,
+        plannedQuestions,
         difficulty,
         language,
         useResume,
@@ -570,7 +573,7 @@ export default function InterviewSetup({ onNavigate }: { onNavigate: (s: Screen)
             <div>
               <Label>Planned questions</Label>
               <div className="readonly-field">
-                {plannedQuestions} question units
+                {plannedQuestions} questions
               </div>
             </div>
           </div>
